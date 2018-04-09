@@ -162,7 +162,7 @@ def calculate_busy_time(rtimes):
     return wtimes
 
 #@profile
-def lambdapack_run(program, pipeline_width=5, msg_vis_timeout=30, cache_size=5, timeout=200, idle_timeout=60):
+def lambdapack_run(program, pipeline_width=5, msg_vis_timeout=60, cache_size=5, timeout=200, idle_timeout=60):
     program.incr_up(1)
     lambda_start = time.time()
     loop = asyncio.new_event_loop()
@@ -182,7 +182,7 @@ def lambdapack_run(program, pipeline_width=5, msg_vis_timeout=30, cache_size=5, 
     tasks = []
     for i in range(pipeline_width):
         # all the async tasks share 1 compute thread and a io cache
-        coro = lambdapack_run_async(loop, program, computer, cache, shared_state=shared_state, timeout=timeout)
+        coro = lambdapack_run_async(loop, program, computer, cache, shared_state=shared_state, msg_vis_timeout=msg_vis_timeout, timeout=timeout)
         tasks.append(loop.create_task(coro))
     #results = loop.run_until_complete(asyncio.gather(*tasks))
     loop.run_forever()
@@ -201,8 +201,8 @@ async def reset_msg_visibility(msg, queue_url, loop, timeout, lock):
             receipt_handle = msg["ReceiptHandle"]
             pc = int(msg["Body"])
             sqs_client = boto3.client('sqs')
-            res = sqs_client.change_message_visibility(VisibilityTimeout=60, QueueUrl=queue_url, ReceiptHandle=receipt_handle)
-            await asyncio.sleep(45)
+            res = sqs_client.change_message_visibility(VisibilityTimeout=timeout, QueueUrl=queue_url, ReceiptHandle=receipt_handle)
+            await asyncio.sleep(max(5, timeout-5))
         except Exception as e:
             print("PC: {0} Exception in reset msg vis ".format(pc) + str(e))
             await asyncio.sleep(10)
@@ -233,7 +233,7 @@ async def check_program_state(program, loop, shared_state, timeout, idle_timeout
 REDIS_CLIENT = None
 
 #@profile
-async def lambdapack_run_async(loop, program, computer, cache, shared_state, pipeline_width=1, msg_vis_timeout=10, timeout=200):
+async def lambdapack_run_async(loop, program, computer, cache, shared_state, pipeline_width=1, msg_vis_timeout=60, timeout=200):
     global REDIS_CLIENT
     #print("LAMBDAPACK_RUN_ASYNC")
     session = aiobotocore.get_session(loop=loop)
