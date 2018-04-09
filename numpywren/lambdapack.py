@@ -514,7 +514,9 @@ class LambdaPackProgram(object):
         self.hash = hashed.hexdigest()
         self.up = 'up' + self.hash
         self.set_up(0)
-        client = boto3.client('sqs', region_name='us-west-2')
+        self.pool_size = 'poolsize' + self.hash
+        self.set_pool_size(0)
+         client = boto3.client('sqs', region_name='us-west-2')
         self.queue_urls = []
         for i in range(num_priorities):
           queue_url = client.create_queue(QueueName=self.hash + str(i))["QueueUrl"]
@@ -837,6 +839,9 @@ class LambdaPackProgram(object):
     def incr_up(self, amount):
       incr(self.up, amount, ip=self.redis_ip)
 
+    def incr_pool_size(self, amount):
+      incr(self.pool_size, amount, ip=self.redis_ip)
+
     def incr_flops(self, amount):
       if (amount > 0):
         incr("{0}_flops".format(self.hash), amount, ip=self.redis_ip)
@@ -867,6 +872,12 @@ class LambdaPackProgram(object):
     def get_up(self):
       return get(self.up, ip=self.redis_ip)
 
+    def decr_pool_size(self, amount):
+      decr(self.pool_size, amount, ip=self.redis_ip)
+
+    def get_pool_size(self):
+      return get(self.pool_size, ip=self.redis_ip)
+
     def get_flops(self):
       return get("{0}_flops".format(self.hash), ip=self.redis_ip)
 
@@ -879,6 +890,9 @@ class LambdaPackProgram(object):
 
     def set_up(self, value):
       put(self.up, value, ip=self.redis_ip)
+
+    def set_pool_size(self, value):
+      put(self.pool_size, value, ip=self.redis_ip)
 
     def wait(self, sleep_time=1):
         status = self.program_status()
