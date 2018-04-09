@@ -516,7 +516,7 @@ class LambdaPackProgram(object):
         self.set_up(0)
         self.pool_size = 'poolsize' + self.hash
         self.set_pool_size(0)
-         client = boto3.client('sqs', region_name='us-west-2')
+        client = boto3.client('sqs', region_name='us-west-2')
         self.queue_urls = []
         for i in range(num_priorities):
           queue_url = client.create_queue(QueueName=self.hash + str(i))["QueueUrl"]

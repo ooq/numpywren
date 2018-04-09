@@ -212,6 +212,7 @@ async def reset_msg_visibility(msg, queue_url, loop, timeout, lock):
 
 async def check_program_state(program, loop, shared_state, timeout, idle_timeout):
     start_time = time.time()
+    last_check_status = time.time()
     while(True):
         if shared_state["busy_workers"] == 0:
             if time.time() - start_time > timeout:
@@ -220,9 +221,11 @@ async def check_program_state(program, loop, shared_state, timeout, idle_timeout
                 break
         #TODO make this an s3 access as opposed to DD access since we don't *really need* atomicity here
         #TODO make this coroutine friendly
-        s = program.program_status()
-        if(s != lp.PS.RUNNING):
-           break
+        if time.time() - last_check_status > 10:
+          s = program.program_status()
+          if(s != lp.PS.RUNNING):
+             break
+          last_check_status = time.time()
         await asyncio.sleep(1)
     print("Closing loop")
     loop.stop()
