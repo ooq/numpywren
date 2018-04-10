@@ -213,6 +213,7 @@ async def reset_msg_visibility(msg, queue_url, loop, timeout, lock):
 async def check_program_state(program, loop, shared_state, timeout, idle_timeout):
     start_time = time.time()
     last_check_status = time.time()
+    shared_state['last_busy_time'] = time.time()
     while(True):
         if shared_state["busy_workers"] == 0:
             if time.time() - start_time > timeout:
@@ -234,21 +235,30 @@ REDIS_CLIENT = None
 
 #@profile
 async def lambdapack_run_async(loop, program, computer, cache, shared_state, pipeline_width=1, msg_vis_timeout=60, timeout=200):
+    shared_state["last_busy_time"] = time.time()
+    print("lambdapack run async started.")
+    start_time = time.time()
     global REDIS_CLIENT
     #print("LAMBDAPACK_RUN_ASYNC")
     session = aiobotocore.get_session(loop=loop)
     # every pipelined worker gets its own copy of program so we don't step on eachothers toes!
     orig_program = program
-    serializer = serialize.SerializeIndependent()
-    byte_string = serializer([program])[0][0]
-    program = pickle.loads(byte_string)
+    #serializer = serialize.SerializeIndependent()
+    #print("serializer creation time: " + str(time.time() - start_time))
+    #byte_string = serializer([program])[0][0]
+    #print("serialization time: " + str(time.time() - start_time))
+    #program = pickle.loads(byte_string)
+    print("pickle time: " + str(time.time() - start_time))
     lmpk_executor = LambdaPackExecutor(program, loop, cache)
-    start_time = time.time()
+    print("executor time: " + str(time.time() - start_time))
     running_times = shared_state['running_times']
     #last_message_time = time.time()
     if (REDIS_CLIENT == None):
       REDIS_CLIENT = redis.StrictRedis(REDIS_IP, port=REDIS_PORT, password=REDIS_PASS, db=0, socket_timeout=5)
+    print("redis time: " + str(time.time() - start_time))
     redis_client = REDIS_CLIENT
+    print("starting work loop: " + str(time.time() - start_time))
+    shared_state["last_busy_time"] = time.time()
     try:
         while(True):
             current_time = time.time()
@@ -269,9 +279,11 @@ async def lambdapack_run_async(loop, program, computer, cache, shared_state, pip
                     # queue_url= messages
                     break
             if ("Messages" not in messages):
+                print("No message is found at " + str(time.time() - start_time))
                 #if time.time() - last_message_time > 10:
                 #    return running_times
                 continue
+            print("Message is found at " + str(time.time() - start_time))
             shared_state["busy_workers"] += 1
             redis_client.incr("{0}_busy".format(program.hash))
             #last_message_time = time.time()
