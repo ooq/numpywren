@@ -29,6 +29,7 @@ import asyncio
 import redis
 import os
 import gc
+from multiprocessing import Process
 #from memory_profiler import profile
 
 try:
@@ -82,6 +83,12 @@ def put(key, value, ip=REDIS_IP, passw=REDIS_PASS , s3=False, s3_bucket=""):
     if (s3):
       # flush write to S3
       raise Exception("Not Implemented")
+
+def upload(key, bucket, data):
+    client = boto3.client('s3')
+    #print("key", key)
+    #print("bucket", bucket)
+    client.put_object(Bucket=bucket, Key=key, Body=data)
 
 
 def get(key, ip=REDIS_IP, passw=REDIS_PASS, s3=False, s3_bucket=""):
@@ -493,7 +500,7 @@ class LambdaPackProgram(object):
        Maintains global state information
     '''
 
-    def __init__(self, inst_blocks, executor=pywren.default_executor, pywren_config=DEFAULT_CONFIG, num_priorities=2, redis_ip=REDIS_IP, io_rate=3e7, flop_rate=20e9, eager=False):
+    def __init__(self, inst_blocks, executor=pywren.default_executor, pywren_config=DEFAULT_CONFIG, num_priorities=2, redis_ip=REDIS_IP, io_rate=3e7, flop_rate=20e9, eager=False, num_program_shards=1000):
         t = time.time()
         pwex = executor(config=pywren_config)
         self.pywren_config = pywren_config
@@ -522,6 +529,8 @@ class LambdaPackProgram(object):
           queue_url = client.create_queue(QueueName=self.hash + str(i))["QueueUrl"]
           self.queue_urls.append(queue_url)
           client.purge_queue(QueueUrl=queue_url)
+        self.worker_queue_url = client.create_queue(QueueName=self.hash+"worker")["QueueUrl"]
+        client.purge_queue(QueueUrl=self.worker_queue_url)
         e = time.time()
         #print("Pre depedency analyze {0}".format(e - t))
         t = time.time()
@@ -547,6 +556,7 @@ class LambdaPackProgram(object):
         self.remote_return = RemoteReturn(max_i_id + 1, self.hash)
         self.return_block = InstructionBlock([self.remote_return], label="EXIT")
         self.inst_blocks.append(self.return_block)
+        self.program_shard_map = {}
 
         for i in self.terminators:
           self.children[i].add(len(self.inst_blocks) - 1)
@@ -555,10 +565,54 @@ class LambdaPackProgram(object):
         self.parents[len(self.inst_blocks) - 1] = self.terminators
         longest_path = self._find_critical_path()
         self.longest_path = longest_path
+        self.priorities = [0 for _ in range(len(self.inst_blocks))]
         self._recursive_priority_donate(self.longest_path, self.max_priority)
         put(self.hash, PS.NOT_STARTED.value, ip=self.redis_ip)
+        self.num_program_shards = num_program_shards
+        self._shard_program()
+
+        self.num_inst_blocks = len(self.inst_blocks)
+        del self.inst_blocks
+
+    def inst_blocks(self, i):
+        t = time.time()
+        client = boto3.client('s3')
+        (shard_idx, idx_in_shard) = self.program_shard_map[i]
+        out_key = "{0}/{1}/{2}".format("lambdapack", self.hash, "program_shard_{0}".format(shard_idx))
+        #print("READING", out_key)
+        #TODO we can cache these
+        serialized_blocks = pickle.loads(client.get_object(Bucket=self.bucket, Key=out_key)["Body"].read())
+        res = pickle.loads(serialized_blocks[idx_in_shard])
+        e = time.time()
+        #print("block fetch took {0} seconds".format(e - t))
+        return res
 
 
+
+    def _shard_program(self, num_cores=32):
+        print("serializing program before sharding")
+        t = time.time()
+        serializer = serialize.SerializeIndependent()
+        serialized_blocks, modules = serializer(self.inst_blocks)
+        program_shard_dict = defaultdict(list)
+        for i, serialized_block in enumerate(serialized_blocks):
+          idx_in_shard = len(program_shard_dict[(i % self.num_program_shards)])
+          shard_idx = (i % self.num_program_shards)
+          #print(shard_idx)
+          program_shard_dict[shard_idx].append(serialized_block)
+          self.program_shard_map[i] = (shard_idx, idx_in_shard)
+        print("sharding program")
+        executor = fs.ProcessPoolExecutor(num_cores)
+        futures = []
+        for key,value in program_shard_dict.items():
+          out_key = "{0}/{1}/{2}".format("lambdapack", self.hash, "program_shard_{0}".format(key))
+          data = pickle.dumps(value)
+          bucket = self.bucket
+          futures.append(executor.submit(upload, out_key, bucket, data))
+        [f.result() for f in futures]
+        e = time.time()
+        print("Sharding program took {0} seconds".format(e - t))
+        return 0
 
 
 
@@ -686,7 +740,7 @@ class LambdaPackProgram(object):
             #print("Adding {0} to sqs queue".format(child))
             async with session.create_client('sqs', use_ssl=False,  region_name='us-west-2') as sqs_client:
               print("SENDING MESSAGE.. {0}".format(child))
-              resp = await sqs_client.send_message(QueueUrl=self.queue_urls[self.inst_blocks[child].priority], MessageBody=str(child))
+              resp = await sqs_client.send_message(QueueUrl=self.queue_urls[self.priorities[child]], MessageBody=str(child))
               print(resp)
               await asyncio.sleep(5)
             if (REDIS_CLIENT == None):
@@ -696,9 +750,9 @@ class LambdaPackProgram(object):
 
           #print("Profile started: {0}".format(i))
           profile_start = time.time()
-          self.inst_blocks[i].end_time = time.time()
-          self.inst_blocks[i].clear()
-          await self.set_profiling_info(i)
+          inst_block.end_time = time.time()
+          inst_block.clear()
+          await self.set_profiling_info(i, inst_block)
           profile_end = time.time()
           profile_time = profile_end - profile_start
           post_op_end = time.time()
@@ -714,7 +768,7 @@ class LambdaPackProgram(object):
             raise
 
     #@profile
-    def post_op(self, i, ret_code, tb=None):
+    def post_op(self, i, ret_code, inst_block, tb=None):
         # need clean post op logic to handle
         # replays
         # avoid double increments
@@ -732,7 +786,6 @@ class LambdaPackProgram(object):
           if (node_status == NS.FINISHED):
             return
           self.set_node_status(i, NS.POST_OP)
-          inst_block = self.inst_blocks[i]
           if (ret_code == PS.EXCEPTION and tb != None):
             #print("EXCEPTION ")
             #print(inst_block)
@@ -785,7 +838,7 @@ class LambdaPackProgram(object):
           assert (i in ready_children) == False
           for child in ready_children:
             #print("Adding {0} to sqs queue".format(child))
-            resp = client.send_message(QueueUrl=self.queue_urls[self.inst_blocks[child].priority], MessageBody=str(child))
+            resp = client.send_message(QueueUrl=self.queue_urls[self.priorities[child]], MessageBody=str(child))
             if (REDIS_CLIENT == None):
               REDIS_CLIENT = redis.StrictRedis(ip=REDIS_IP, port=REDIS_PORT, passw=REDIS_PASS, db=0, socket_timeout=5)
               #REDIS_CLIENT = redis.StrictRedis(ip, port=REDIS_PORT, db=0, socket_timeout=5)
@@ -793,9 +846,9 @@ class LambdaPackProgram(object):
 
           #print("Profile started: {0}".format(i))
           profile_start = time.time()
-          self.inst_blocks[i].end_time = time.time()
-          self.inst_blocks[i].clear()
-          self.set_profiling_info(i)
+          inst_block.end_time = time.time()
+          inst_block.clear()
+          self.set_profiling_info(i, inst_block)
           profile_end = time.time()
           profile_time = profile_end - profile_start
           #print("Profile finished: {0} took {1}".format(i, profile_time))
@@ -818,9 +871,8 @@ class LambdaPackProgram(object):
         sqs = boto3.resource('sqs')
         for starter in self.starters:
           #print("Enqueuing ", starter)
-          inst_block = self.inst_blocks[starter]
           self.set_node_status(starter, NS.READY)
-          priority = inst_block.priority
+          priority = self.priorities[starter]
           queue = sqs.Queue(self.queue_urls[priority])
           queue.send_message(MessageBody=str(starter))
 
@@ -918,8 +970,7 @@ class LambdaPackProgram(object):
 
 
 
-    def set_profiling_info(self, pc):
-        inst_block = self.inst_blocks[pc]
+    def set_profiling_info(self, pc, inst_block):
         serializer = serialize.SerializeIndependent()
         byte_string = serializer([inst_block])[0][0]
         client = boto3.client('s3', region_name='us-west-2')
@@ -957,6 +1008,7 @@ class LambdaPackProgram(object):
         return
       for node in nodes:
          self.inst_blocks[node].priority = max(min(priority, self.max_priority), self.inst_blocks[node].priority)
+         self.priorities[node] = self.inst_blocks[node].priority
          self._recursive_priority_donate(self.parents[node], priority - 1)
 
 
